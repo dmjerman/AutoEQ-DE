@@ -1,0 +1,748 @@
+import tkinter as tk
+from tkinter import filedialog, messagebox
+import os, math, csv, threading, multiprocessing
+import numpy as np
+import matplotlib.pyplot as plt
+from functools import partial
+from scipy.optimize import differential_evolution
+from numba import njit
+from scipy.signal import savgol_filter
+
+# -------------------------------------------------------------------
+# GLOBAL CONFIGURATION
+# -------------------------------------------------------------------
+FREQ_MIN = 20.0
+FREQ_MAX = 20000.0
+NUM_FREQ_POINTS = 300       # Frequency grid resolution
+SAMPLE_RATE = 384000.0      # e.g. 384 kHz
+
+# EQ parameter bounds (for peaks; shelves are constrained separately)
+BOUNDS_FREQ = (20.0, 16000.0)
+BOUNDS_GAIN = (-12.0, 6.0)    # Avoid excessive boost
+BOUNDS_Q = (0.3, 4.0)         # Tighter Q to discourage overly narrow filters
+
+# Differential Evolution settings
+MAXITER = 100
+POPSIZE = 15
+MAX_WORKERS = multiprocessing.cpu_count()
+
+# Final overall gain clip (dB)
+FINAL_MAX_GAIN = 6.0
+
+# Base penalty constants
+GAIN_THRESHOLD = 6.0
+GAIN_PENALTY_MULTIPLIER_DEFAULT = 10.0  # For frequencies >=200 Hz; use 5.0 for bass (<200 Hz)
+Q_PENALTY_MULTIPLIER = 50.0
+
+# New penalty multipliers:
+EXTRA_Q_MULTIPLIER = 100.0           # Extra penalty if Q > 2.5
+OVERLAP_THRESHOLD = 0.90             # Existing soft overlap penalty based on ratio
+SPACING_PENALTY_MULTIPLIER = 50.0      # Penalty if two peak filters are closer than 100 Hz
+
+# -------------------------------------------------------------------
+# TARGET CURVES
+# -------------------------------------------------------------------
+HARMAN_OVER_EAR_APPROX = [
+    (20, 6.0), (25, 5.8), (31.5, 5.5), (40, 5.2), (50, 5.0),
+    (63, 4.8), (80, 4.5), (100, 4.2), (125, 3.8), (160, 3.4),
+    (200, 2.9), (250, 2.2), (315, 1.5), (400, 1.0), (500, 0.5),
+    (630, 0.0), (800, -0.3), (1000, 0.0), (1250, 0.6), (1600, 1.3),
+    (2000, 2.5), (2500, 3.0), (3000, 3.5), (4000, 3.2), (5000, 2.8),
+    (6000, 1.5), (7000, 0.0), (8000, -1.0), (10000, -1.5), (12000, -2.0),
+    (15000, -3.0), (20000, -5.0)
+]
+
+KNOWLES_PREFERRED_RESPONSE = [
+    (20, 6.0), (25, 5.8), (31.5, 5.5), (40, 5.2), (50, 5.0),
+    (63, 4.8), (80, 4.5), (100, 4.2), (125, 3.8), (160, 3.4),
+    (200, 2.9), (250, 2.2), (315, 1.5), (400, 1.0), (500, 0.5),
+    (630, 0.0), (800, -0.3), (1000, 0.0), (1250, 0.6), (1600, 1.3),
+    (2000, 2.5), (2500, 3.0), (3000, 3.5), (4000, 3.2), (5000, 2.8),
+    (6000, 1.5), (7000, 0.0), (8000, -1.0), (10000, 0.5), (12000, 0.0),
+    (15000, -1.0), (20000, -2.0)
+]
+
+REFERENCE_CURVES = {
+    "Harman OverEar (Approx)": HARMAN_OVER_EAR_APPROX,
+    "Knowles Preferred": KNOWLES_PREFERRED_RESPONSE
+}
+
+# -------------------------------------------------------------------
+# NON-LINEAR HEARING CORRECTION SCALING FUNCTION
+# -------------------------------------------------------------------
+def nonlinear_scale_hearing(raw_db, factor=0.2, knee=6.0):
+    scaled = raw_db * factor
+    if scaled > knee:
+        scaled = knee + (scaled - knee) * 0.5
+    return scaled
+
+# -------------------------------------------------------------------
+# CSV LOADING FUNCTIONS
+# -------------------------------------------------------------------
+def load_headphone_csv(filepath):
+    data = []
+    try:
+        with open(filepath, 'r', encoding='utf-8') as f:
+            reader = csv.reader(f)
+            for row in reader:
+                if len(row) < 2:
+                    continue
+                try:
+                    freq = float(row[0])
+                    val = float(row[1])
+                    data.append((freq, val))
+                except ValueError:
+                    pass
+    except Exception as e:
+        raise Exception(f"Error reading headphone CSV: {e}")
+    data.sort(key=lambda x: x[0])
+    return data
+
+def load_hearing_csv(filepath, partial_factor=0.5):
+    data = []
+    try:
+        with open(filepath, 'r', encoding='utf-8') as f:
+            reader = csv.reader(f)
+            for row in reader:
+                if len(row) < 2:
+                    continue
+                try:
+                    freq = float(row[0])
+                    if len(row) == 2:
+                        loss = float(row[1])
+                    else:
+                        leftEar = float(row[1])
+                        rightEar = float(row[2])
+                        loss = (leftEar + rightEar) / 2.0
+                    loss_dB = nonlinear_scale_hearing(loss, factor=partial_factor, knee=6.0)
+                    data.append((freq, loss_dB))
+                except ValueError:
+                    pass
+    except Exception as e:
+        raise Exception(f"Error reading hearing CSV: {e}")
+    data.sort(key=lambda x: x[0])
+    return data
+
+# -------------------------------------------------------------------
+# DATA MERGING & SUBTRACTION
+# -------------------------------------------------------------------
+def merge_data(primary, secondary):
+    if not secondary:
+        return primary
+    freqs = sorted(set(p[0] for p in primary).union(q[0] for q in secondary))
+    def interp_dB(data, f):
+        if f <= data[0][0]:
+            return data[0][1]
+        if f >= data[-1][0]:
+            return data[-1][1]
+        for i in range(len(data)-1):
+            f1, g1 = data[i]
+            f2, g2 = data[i+1]
+            if f1 <= f <= f2:
+                t = (f - f1) / (f2 - f1)
+                return g1 + t*(g2-g1)
+        return data[-1][1]
+    out = []
+    for f in freqs:
+        p_val = interp_dB(primary, f)
+        s_val = interp_dB(secondary, f)
+        out.append((f, p_val + s_val))
+    return out
+
+def subtract_data(primary, reference):
+    if not reference:
+        return primary
+    freqs = sorted(set(p[0] for p in primary).union(q[0] for q in reference))
+    def interp_dB(data, f):
+        if f <= data[0][0]:
+            return data[0][1]
+        if f >= data[-1][0]:
+            return data[-1][1]
+        for i in range(len(data)-1):
+            f1, g1 = data[i]
+            f2, g2 = data[i+1]
+            if f1 <= f <= f2:
+                t = (f - f1) / (f2 - f1)
+                return g1 + t*(g2-g1)
+        return data[-1][1]
+    out = []
+    for f in freqs:
+        p_val = interp_dB(primary, f)
+        r_val = interp_dB(reference, f)
+        out.append((f, p_val - r_val))
+    return out
+
+def apply_psychoacoustic_to_data(data, psycho_filters):
+    def peak_filter_mag(f, Fc, GdB, Q):
+        A = 10**(GdB/40.0)
+        w = 2*math.pi*(f/SAMPLE_RATE)
+        alpha = math.sin(w)/(2*Q)
+        b0 = 1 + alpha*A
+        b1 = -2*math.cos(w)
+        b2 = 1 - alpha*A
+        a0 = 1 + alpha/A
+        a1 = -2*math.cos(w)
+        a2 = 1 - alpha/A
+        b0 /= a0; b1 /= a0; b2 /= a0
+        a1 /= a0; a2 /= a0
+        ejw1 = complex(math.cos(-w), math.sin(-w))
+        ejw2 = complex(math.cos(-2*w), math.sin(-2*w))
+        num = b0 + b1*ejw1 + b2*ejw2
+        den = 1.0 + a1*ejw1 + a2*ejw2
+        return abs(num/den)
+    out = []
+    for (freq, raw_db) in data:
+        lin = 10**(raw_db/20.0)
+        for (Fc, gdB, Q) in psycho_filters:
+            lin *= peak_filter_mag(freq, Fc, gdB, Q)
+        new_db = 20*math.log10(lin) if lin>1e-12 else -999.0
+        out.append((freq,new_db))
+    return out
+
+# -------------------------------------------------------------------
+# BUILD FINAL TARGET CURVE 
+# -------------------------------------------------------------------
+def build_target_curve(data):
+    data = np.array(data)
+    sorted_idx = np.argsort(data[:,0])
+    freqs_data = data[sorted_idx,0]
+    db_data = data[sorted_idx,1]
+    
+    freqs = np.logspace(math.log10(FREQ_MIN), math.log10(FREQ_MAX), NUM_FREQ_POINTS)
+    target_db = np.interp(freqs, freqs_data, db_data)
+    
+    max_target = np.max(target_db)
+    if max_target > FINAL_MAX_GAIN:
+        target_db -= (max_target - FINAL_MAX_GAIN)
+    target_db = savgol_filter(target_db, window_length=21, polyorder=5)
+    return freqs, target_db
+
+# -------------------------------------------------------------------
+# FILTER RESPONSE FUNCTIONS (Shelves & Peaks)
+# -------------------------------------------------------------------
+@njit
+def low_shelf_filter_magnitude_numba(f, Fc, GdB, Q, sr):
+    A = 10 ** (GdB/40.0)
+    w0 = 2*math.pi*(f/sr)
+    cos_w0 = math.cos(w0)
+    sin_w0 = math.sin(w0)
+    alpha = sin_w0/(2*Q)
+    b0 = A*((A+1) - (A-1)*cos_w0 + 2*math.sqrt(A)*alpha)
+    b1 = 2*A*((A-1) - (A+1)*cos_w0)
+    b2 = A*((A+1) - (A-1)*cos_w0 - 2*math.sqrt(A)*alpha)
+    a0 = (A+1) + (A-1)*cos_w0 + 2*math.sqrt(A)*alpha
+    a1 = -2*((A-1) + (A+1)*cos_w0)
+    a2 = (A+1) + (A-1)*cos_w0 - 2*math.sqrt(A)*alpha
+    b0 /= a0; b1 /= a0; b2 /= a0
+    a1 /= a0; a2 /= a0
+    ejw1 = complex(math.cos(-w0), math.sin(-w0))
+    ejw2 = complex(math.cos(-2*w0), math.sin(-2*w0))
+    num = b0 + b1*ejw1 + b2*ejw2
+    den = 1.0 + a1*ejw1 + a2*ejw2
+    return abs(num/den)
+
+@njit
+def high_shelf_filter_magnitude_numba(f, Fc, GdB, Q, sr):
+    A = 10 ** (GdB/40.0)
+    w0 = 2*math.pi*(f/sr)
+    cos_w0 = math.cos(w0)
+    sin_w0 = math.sin(w0)
+    alpha = sin_w0/(2*Q)
+    b0 = A*((A+1) + (A-1)*cos_w0 + 2*math.sqrt(A)*alpha)
+    b1 = -2*A*((A-1) + (A+1)*cos_w0)
+    b2 = A*((A+1) + (A-1)*cos_w0 - 2*math.sqrt(A)*alpha)
+    a0 = (A+1) - (A-1)*cos_w0 + 2*math.sqrt(A)*alpha
+    a1 = 2*((A-1) - (A+1)*cos_w0)
+    a2 = (A+1) - (A-1)*cos_w0 - 2*math.sqrt(A)*alpha
+    b0 /= a0; b1 /= a0; b2 /= a0
+    a1 /= a0; a2 /= a0
+    ejw1 = complex(math.cos(-w0), math.sin(-w0))
+    ejw2 = complex(math.cos(-2*w0), math.sin(-2*w0))
+    num = b0 + b1*ejw1 + b2*ejw2
+    den = 1.0 + a1*ejw1 + a2*ejw2
+    return abs(num/den)
+
+@njit
+def peak_filter_magnitude_numba(f, Fc, GdB, Q, sr):
+    A = 10 ** (GdB/40.0)
+    w = 2*math.pi*(f/sr)
+    alpha = math.sin(w)/(2*Q)
+    b0 = 1.0 + alpha*A
+    b1 = -2.0 * math.cos(w)
+    b2 = 1.0 - alpha*A
+    a0 = 1.0 + alpha/A
+    a1 = -2.0 * math.cos(w)
+    a2 = 1.0 - alpha/A
+    b0 /= a0; b1 /= a0; b2 /= a0
+    a1 /= a0; a2 /= a0
+    ejw1 = complex(math.cos(-w), math.sin(-w))
+    ejw2 = complex(math.cos(-2*w), math.sin(-2*w))
+    num = b0 + b1*ejw1 + b2*ejw2
+    den = 1.0 + a1*ejw1 + a2*ejw2
+    return abs(num/den)
+
+def peak_filter_magnitude(f, Fc, GdB, Q, sr):
+    return peak_filter_magnitude_numba(f, Fc, GdB, Q, sr)
+
+# -------------------------------------------------------------------
+# COST FUNCTION WITH SHELVES, PEAKS, & DYNAMIC PENALTIES
+# -------------------------------------------------------------------
+@njit
+def global_de_cost_numba_shelves(params, freqs, target_db, sample_rate, n_filters, spl, weights):
+    total_cost = 0.0
+    for i in range(len(freqs)):
+        f = freqs[i]
+        eq_lin = 1.0
+        # Loudness-based adjustment for shelves:
+        Fc0, GdB0, Q0 = params[0], params[1], params[2]
+        adjusted_GdB0 = GdB0 * (1.0 + 0.02*(85.0 - spl))
+        eq_lin *= low_shelf_filter_magnitude_numba(f, Fc0, adjusted_GdB0, Q0, sample_rate)
+        Fc1, GdB1, Q1 = params[3], params[4], params[5]
+        adjusted_GdB1 = GdB1 * (1.0 + 0.02*(85.0 - spl))
+        eq_lin *= high_shelf_filter_magnitude_numba(f, Fc1, adjusted_GdB1, Q1, sample_rate)
+        # Peak filters:
+        for j in range(2, n_filters):
+            idx = 6 + 3*(j-2)
+            Fc = params[idx]
+            GdB = params[idx+1]
+            Q_val = params[idx+2]
+            eq_lin *= peak_filter_magnitude_numba(f, Fc, GdB, Q_val, sample_rate)
+        if eq_lin > 1e-12:
+            eq_db = 20.0 * math.log10(eq_lin)
+        else:
+            eq_db = -999.0
+        diff = target_db[i] - eq_db
+        total_cost += weights[i] * diff * diff
+
+    penalty = 0.0
+    # Shelf penalties:
+    if adjusted_GdB0 > GAIN_THRESHOLD:
+        mult = 5.0 if Fc0 < 200.0 else GAIN_PENALTY_MULTIPLIER_DEFAULT
+        penalty += mult * (adjusted_GdB0 - GAIN_THRESHOLD)**2
+    q_threshold_low = 4.0 + 2.0 * math.exp(-Fc0/5000.0)
+    if Q0 > q_threshold_low:
+        penalty += Q_PENALTY_MULTIPLIER * (Q0 - q_threshold_low)**2
+    if Q0 > 2.5:
+        penalty += EXTRA_Q_MULTIPLIER * (Q0 - 2.5)**2
+
+    if adjusted_GdB1 > GAIN_THRESHOLD:
+        mult = 5.0 if Fc1 < 200.0 else GAIN_PENALTY_MULTIPLIER_DEFAULT
+        penalty += mult * (adjusted_GdB1 - GAIN_THRESHOLD)**2
+    q_threshold_high = 4.0 + 2.0 * math.exp(-Fc1/5000.0)
+    if Q1 > q_threshold_high:
+        penalty += Q_PENALTY_MULTIPLIER * (Q1 - q_threshold_high)**2
+    if Q1 > 2.5:
+        penalty += EXTRA_Q_MULTIPLIER * (Q1 - 2.5)**2
+
+    # Peak penalties:
+    for j in range(2, n_filters):
+        idx = 6 + 3*(j-2)
+        Fc = params[idx]
+        GdB = params[idx+1]
+        Q_val = params[idx+2]
+        if GdB > GAIN_THRESHOLD:
+            mult = 5.0 if Fc < 200.0 else GAIN_PENALTY_MULTIPLIER_DEFAULT
+            penalty += mult * (GdB - GAIN_THRESHOLD)**2
+        q_threshold_peak = 4.0 + 2.0 * math.exp(-Fc/5000.0)
+        if Q_val > q_threshold_peak:
+            penalty += Q_PENALTY_MULTIPLIER * (Q_val - q_threshold_peak)**2
+        if Q_val > 2.5:
+            penalty += EXTRA_Q_MULTIPLIER * (Q_val - 2.5)**2
+
+    # Soft overlap penalty for peaks (using ratio and enforcing a 100 Hz minimum gap):
+    for j in range(2, n_filters):
+        idx_j = 6 + 3*(j-2)
+        Fc_j = params[idx_j]
+        Q_j = params[idx_j+2]
+        for k in range(j+1, n_filters):
+            idx_k = 6 + 3*(k-2)
+            Fc_k = params[idx_k]
+            Q_k = params[idx_k+2]
+            ratio = Fc_j / Fc_k if Fc_j < Fc_k else Fc_k / Fc_j
+            if ratio > OVERLAP_THRESHOLD:
+                Q_avg = (Q_j + Q_k) / 2.0
+                penalty += 100.0 * (ratio - OVERLAP_THRESHOLD) * (1 - 1.0/(1.0+Q_avg))
+            if abs(Fc_j - Fc_k) < 100.0:
+                penalty += SPACING_PENALTY_MULTIPLIER * (100.0 - abs(Fc_j - Fc_k))**2
+    return total_cost + penalty
+
+def global_de_cost_shelves(params, freqs, target_db, sample_rate, n_filters, spl, weights):
+    return global_de_cost_numba_shelves(params, freqs, target_db, sample_rate, n_filters, spl, weights)
+
+# -------------------------------------------------------------------
+# DIFFERENTIAL EVOLUTION OPTIMIZATION
+# -------------------------------------------------------------------
+def run_differential_evolution(n_filters, freqs, target_db, sample_rate, spl, weights, realtime=False):
+    total_params = 3*n_filters  # 2 shelves + (n_filters-2) peaks
+    bounds = []
+    for i in range(total_params):
+        mod = i % 3
+        # Force shelf frequencies into specific ranges:
+        if i == 0:  # low-shelf frequency
+            bounds.append((20.0, 200.0))
+        elif i == 3:  # high-shelf frequency
+            bounds.append((6000.0, 16000.0))
+        elif mod == 0:
+            bounds.append((BOUNDS_FREQ[0], BOUNDS_FREQ[1]))
+        elif mod == 1:
+            bounds.append((BOUNDS_GAIN[0], BOUNDS_GAIN[1]))
+        else:
+            bounds.append((BOUNDS_Q[0], BOUNDS_Q[1]))
+    
+    callback_func = None
+    if realtime:
+        plt.ion()
+        def callback_func(x, convergence):
+            eq_response = []
+            for f in freqs:
+                eq_lin = 1.0
+                Fc0, GdB0, Q0 = x[0], x[1], x[2]
+                adjusted_GdB0 = GdB0 * (1 + 0.02*(85 - spl))
+                eq_lin *= low_shelf_filter_magnitude_numba(f, Fc0, adjusted_GdB0, Q0, SAMPLE_RATE)
+                Fc1, GdB1, Q1 = x[3], x[4], x[5]
+                adjusted_GdB1 = GdB1 * (1 + 0.02*(85 - spl))
+                eq_lin *= high_shelf_filter_magnitude_numba(f, Fc1, adjusted_GdB1, Q1, SAMPLE_RATE)
+                for j in range(2, n_filters):
+                    idx = 6 + 3*(j-2)
+                    Fc = x[idx]
+                    GdB = x[idx+1]
+                    Q_val = x[idx+2]
+                    eq_lin *= peak_filter_magnitude_numba(f, Fc, GdB, Q_val, SAMPLE_RATE)
+                if eq_lin > 1e-12:
+                    eq_db = 20*math.log10(eq_lin)
+                else:
+                    eq_db = -999.0
+                eq_response.append(eq_db)
+            plt.clf()
+            plt.plot(freqs, target_db, label="Target Curve", color="blue", linestyle="--")
+            plt.plot(freqs, eq_response, label="Current Fitted EQ", color="red")
+            plt.xscale("log")
+            plt.xlabel("Frequency (Hz)")
+            plt.ylabel("Gain (dB)")
+            plt.title("Real-Time EQ Optimization Progress")
+            plt.legend()
+            plt.pause(0.01)
+        callback_func = callback_func
+
+    cost_func = partial(global_de_cost_shelves, freqs=freqs, target_db=target_db,
+                        sample_rate=sample_rate, n_filters=n_filters, spl=spl, weights=weights)
+    result = differential_evolution(cost_func, bounds, strategy='best1bin',
+                                    maxiter=MAXITER, popsize=POPSIZE,
+                                    workers=MAX_WORKERS, disp=False,
+                                    callback=callback_func)
+    return result.fun, result.x
+
+# -------------------------------------------------------------------
+# TKINTER GUI
+# -------------------------------------------------------------------
+class AutoEQPEQGUI:
+    def __init__(self, master):
+        self.master = master
+        self.master.title("AutoEQ + DE (Shelves+Peaks EQ)")
+        
+        # File selections
+        self.headphone_file = None
+        self.hearing_file = None
+        self.output_file = None
+        
+        # GUI variables
+        self.num_filters_var = tk.IntVar(value=6)  # e.g., total filters (2 shelves + 4 peaks)
+        self.hearing_factor_var = tk.DoubleVar(value=0.15)
+        self.psycho_var = tk.BooleanVar(value=False)
+        self.target_curve_var = tk.StringVar(value="Harman OverEar (Approx)")
+        self.headphone_type_var = tk.StringVar(value="Closed-Back")
+        self.realtime_var = tk.BooleanVar(value=False)
+        self.spl_var = tk.DoubleVar(value=85.0)  # Listening SPL
+        
+        row = 0
+        tk.Label(master, text="Headphone CSV:").grid(row=row, column=0, sticky="e", padx=5, pady=5)
+        tk.Button(master, text="Browse...", command=self.select_headphone_file).grid(row=row, column=1, padx=5, pady=5)
+        self.lbl_hp = tk.Label(master, text="No file selected")
+        self.lbl_hp.grid(row=row, column=2, padx=5, pady=5)
+        row += 1
+        
+        tk.Label(master, text="Hearing CSV (optional):").grid(row=row, column=0, sticky="e", padx=5, pady=5)
+        tk.Button(master, text="Browse...", command=self.select_hearing_file).grid(row=row, column=1, padx=5, pady=5)
+        self.lbl_hr = tk.Label(master, text="No file selected")
+        self.lbl_hr.grid(row=row, column=2, padx=5, pady=5)
+        row += 1
+        
+        tk.Label(master, text="Hearing factor (0..1):").grid(row=row, column=0, sticky="e", padx=5, pady=5)
+        tk.Spinbox(master, from_=0.0, to=1.0, increment=0.05, textvariable=self.hearing_factor_var).grid(row=row, column=1, padx=5, pady=5)
+        row += 1
+
+        tk.Label(master, text="Listening SPL (dB):").grid(row=row, column=0, sticky="e", padx=5, pady=5)
+        tk.Spinbox(master, from_=50, to=100, increment=1, textvariable=self.spl_var).grid(row=row, column=1, padx=5, pady=5)
+        row += 1
+        
+        tk.Label(master, text="Target Curve:").grid(row=row, column=0, sticky="e", padx=5, pady=5)
+        self.target_curve_menu = tk.OptionMenu(master, self.target_curve_var, *REFERENCE_CURVES.keys())
+        self.target_curve_menu.grid(row=row, column=1, sticky="w", padx=5, pady=5)
+        row += 1
+        
+        tk.Label(master, text="Headphone Type:").grid(row=row, column=0, sticky="e", padx=5, pady=5)
+        self.headphone_type_menu = tk.OptionMenu(master, self.headphone_type_var, "Closed-Back", "Open-Back")
+        self.headphone_type_menu.grid(row=row, column=1, sticky="w", padx=5, pady=5)
+        row += 1
+        
+        tk.Label(master, text="Output EQ File:").grid(row=row, column=0, sticky="e", padx=5, pady=5)
+        tk.Button(master, text="Browse...", command=self.select_output_file).grid(row=row, column=1, padx=5, pady=5)
+        self.lbl_out = tk.Label(master, text="No file selected")
+        self.lbl_out.grid(row=row, column=2, padx=5, pady=5)
+        row += 1
+        
+        tk.Label(master, text="# Filters (>=2):").grid(row=row, column=0, sticky="e", padx=5, pady=5)
+        tk.Spinbox(master, from_=2, to=40, textvariable=self.num_filters_var).grid(row=row, column=1, padx=5, pady=5)
+        row += 1
+        
+        tk.Checkbutton(master, text="Enable Psychoacoustic Enhancements", variable=self.psycho_var).grid(row=row, column=0, columnspan=3, sticky="w", padx=5, pady=5)
+        row += 1
+        
+        tk.Checkbutton(master, text="Enable Realtime Graph", variable=self.realtime_var).grid(row=row, column=0, columnspan=3, sticky="w", padx=5, pady=5)
+        row += 1
+        
+        tk.Button(master, text="Run DE Optimization", command=self.run_optimization).grid(row=row, column=0, columnspan=3, pady=10)
+        row += 1
+        
+        tk.Button(master, text="Show Intermediate Curves", command=self.show_intermediate).grid(row=row, column=0, columnspan=3, pady=10)
+        row += 1
+        
+        self.status_label = tk.Label(master, text="", fg="blue")
+        self.status_label.grid(row=row, column=0, columnspan=3, pady=10)
+    
+    def select_headphone_file(self):
+        fname = filedialog.askopenfilename(title="Select Headphone CSV",
+                                           filetypes=[("CSV Files", "*.csv"), ("All Files", "*.*")])
+        if fname:
+            self.headphone_file = fname
+            self.lbl_hp.config(text=os.path.basename(fname))
+    
+    def select_hearing_file(self):
+        fname = filedialog.askopenfilename(title="Select Hearing CSV",
+                                           filetypes=[("CSV Files", "*.csv"), ("All Files", "*.*")])
+        if fname:
+            self.hearing_file = fname
+            self.lbl_hr.config(text=os.path.basename(fname))
+    
+    def select_output_file(self):
+        fname = filedialog.asksaveasfilename(defaultextension=".txt",
+                                             filetypes=[("Text Files", "*.txt"), ("All Files", "*.*")])
+        if fname:
+            self.output_file = fname
+            self.lbl_out.config(text=os.path.basename(fname))
+    
+    def run_optimization(self):
+        if not self.headphone_file or not self.output_file:
+            self.status_label.config(text="Headphone and output file required!", fg="red")
+            return
+        if self.num_filters_var.get() < 2:
+            self.status_label.config(text="# Filters must be >=2!", fg="red")
+            return
+        self.status_label.config(text="Running DE Optimization...", fg="blue")
+        self.master.update_idletasks()
+        threading.Thread(target=self.perform_optimization, daemon=True).start()
+    
+    def perform_optimization(self):
+        try:
+            # 1) Load headphone data
+            hp_data = load_headphone_csv(self.headphone_file)
+            # 2) Subtract chosen Harman reference from headphone data
+            chosen_curve = self.target_curve_var.get()
+            ref_data = REFERENCE_CURVES.get(chosen_curve, [])
+            if ref_data:
+                hp_data = subtract_data(hp_data, ref_data)
+            # 3) Load hearing correction data (if available)
+            hearing_factor = self.hearing_factor_var.get()
+            hr_data = []
+            if self.hearing_file:
+                hr_data = load_hearing_csv(self.hearing_file, partial_factor=hearing_factor)
+            # 4) Merge data: (measurement – reference) + hearing correction
+            merged = merge_data(hp_data, hr_data)
+            # 5) Apply psychoacoustic enhancements if enabled
+            if self.psycho_var.get():
+                psycho_filters = [(60.0, 2.0, 1.0), (300.0, -2.5, 1.2), (3000.0, 3.0, 1.5)]
+                merged = apply_psychoacoustic_to_data(merged, psycho_filters)
+            # 6) Build final target curve
+            freqs, target_db = build_target_curve(merged)
+            # For Open-Back, add extra bass boost below 100 Hz
+            if self.headphone_type_var.get() == "Open-Back":
+                for i, f in enumerate(freqs):
+                    if f < 100:
+                        boost = 3.0 * (100 - f) / 80.0
+                        target_db[i] += boost
+            n_filters = self.num_filters_var.get()
+            spl = self.spl_var.get()  # Listening SPL
+            
+            # Create frequency-dependent weights (boost importance in 1–5 kHz range)
+            weights = np.ones_like(freqs)
+            for i, f in enumerate(freqs):
+                if 1000 <= f <= 5000:
+                    weights[i] = 2.0
+
+            # 7) Run DE optimization with new cost function
+            best_cost, best_params = run_differential_evolution(n_filters, freqs, target_db, SAMPLE_RATE,
+                                                                spl, weights, realtime=self.realtime_var.get())
+            # Parse filter parameters: first two are shelves, rest are peaks.
+            peq_list = []
+            Fc0, GdB0, Q0 = best_params[0], best_params[1], best_params[2]
+            peq_list.append((Fc0, GdB0, Q0, "LowShelf"))
+            Fc1, GdB1, Q1 = best_params[3], best_params[4], best_params[5]
+            peq_list.append((Fc1, GdB1, Q1, "HighShelf"))
+            for j in range(2, n_filters):
+                idx = 6 + 3*(j-2)
+                fc = best_params[idx]
+                gdB = best_params[idx+1]
+                qq = best_params[idx+2]
+                peq_list.append((fc, gdB, qq, "Peak"))
+            # 8) Intelligent Preamp Compensation
+            all_gains = [flt[1] for flt in peq_list]
+            max_gain = max(all_gains)
+            preamp = -max(0, max_gain - FINAL_MAX_GAIN)
+            
+            # 9) Write results to output file using Equalizer APO / Peace syntax
+            lines = []
+            lines.append(f"Preamp: {preamp:.2f} dB")
+            for i, (fc, g, q, typ) in enumerate(peq_list, start=1):
+                if typ == "LowShelf":
+                    type_str = "LS"
+                elif typ == "HighShelf":
+                    type_str = "HS"
+                else:
+                    type_str = "PK"
+                lines.append(f"Filter {i}: ON {type_str} Fc {fc:.2f} Hz Gain {g:.2f} dB Q {q:.2f}")
+            try:
+                with open(self.output_file, "w", encoding='utf-8') as f:
+                    for ln in lines:
+                        f.write(ln + "\n")
+            except Exception as e:
+                self.master.after(0, lambda e=e: self.status_label.config(text=f"File write error: {e}", fg="red"))
+                return
+            
+            # Recalculate final EQ response using loudness-adjusted shelves:
+            final_db = []
+            for f in freqs:
+                eq_lin = 1.0
+                fc, g, q, _ = peq_list[0]
+                adjusted_g = g * (1 + 0.02*(85 - spl))
+                eq_lin *= low_shelf_filter_magnitude_numba(f, fc, adjusted_g, q, SAMPLE_RATE)
+                fc, g, q, _ = peq_list[1]
+                adjusted_g = g * (1 + 0.02*(85 - spl))
+                eq_lin *= high_shelf_filter_magnitude_numba(f, fc, adjusted_g, q, SAMPLE_RATE)
+                for filt in peq_list[2:]:
+                    fc, g, q, _ = filt
+                    eq_lin *= peak_filter_magnitude_numba(f, fc, g, q, SAMPLE_RATE)
+                if eq_lin > 1e-12:
+                    eq_db = 20 * math.log10(eq_lin)
+                else:
+                    eq_db = -999.0
+                final_db.append(eq_db)
+            # Show final results graph
+            raw_freqs = [m[0] for m in merged]
+            raw_vals = [m[1] for m in merged]
+            self.master.after(0, lambda: self.show_results(raw_freqs, raw_vals, freqs, target_db, final_db, best_cost, preamp))
+        except Exception as e:
+            self.master.after(0, lambda e=e: self.status_label.config(text=f"Error during optimization: {e}", fg="red"))
+    
+    def show_results(self, raw_freqs, raw_vals, freqs, target_db, final_db, best_cost, preamp):
+        plt.figure(figsize=(10,10))
+        plt.subplot(2,1,1)
+        plt.plot(raw_freqs, raw_vals, label="Merged Raw Target", color='blue')
+        plt.plot(freqs, target_db, label="Normalized Target", linestyle="--", color='blue', alpha=0.5)
+        plt.plot(freqs, final_db, label="Fitted Shelves+Peaks", color='red')
+        plt.xscale("log")
+        plt.xlabel("Frequency (Hz)")
+        plt.ylabel("Gain (dB)")
+        plt.title(f"Final EQ Response (Cost={best_cost:.2f}, Preamp={preamp:.2f} dB)")
+        plt.grid(True, which='both', linestyle=':')
+        plt.legend()
+        
+        plt.subplot(2,1,2)
+        error_curve = target_db - np.array(final_db)
+        plt.plot(freqs, error_curve, label="Error (Target - Fitted)", color='green')
+        plt.axhline(0, color='black', linestyle='--')
+        plt.fill_between(freqs, -2, 2, color='gray', alpha=0.2, label="±2 dB Tolerance")
+        plt.xscale("log")
+        plt.xlabel("Frequency (Hz)")
+        plt.ylabel("Error (dB)")
+        plt.title("Error Curve")
+        plt.grid(True, which='both', linestyle=':')
+        plt.legend()
+        plt.tight_layout()
+        plt.show()
+        self.status_label.config(text=f"Done! Cost={best_cost:.2f}, Preamp={preamp:.2f} dB", fg="green")
+    
+    def show_intermediate(self):
+        if not self.headphone_file:
+            self.status_label.config(text="Headphone file required for intermediate plot!", fg="red")
+            return
+        try:
+            hp_data = load_headphone_csv(self.headphone_file)
+            chosen_curve = self.target_curve_var.get()
+            harman_data = REFERENCE_CURVES.get(chosen_curve, [])
+            freqs = np.logspace(math.log10(FREQ_MIN), math.log10(FREQ_MAX), NUM_FREQ_POINTS)
+            def interp_curve(data, freqs):
+                sorted_data = sorted(data, key=lambda x: x[0])
+                interp_vals = []
+                for f in freqs:
+                    if f <= sorted_data[0][0]:
+                        interp_vals.append(sorted_data[0][1])
+                    elif f >= sorted_data[-1][0]:
+                        interp_vals.append(sorted_data[-1][1])
+                    else:
+                        for i in range(len(sorted_data)-1):
+                            f1, g1 = sorted_data[i]
+                            f2, g2 = sorted_data[i+1]
+                            if f1 <= f <= f2:
+                                t = (f - f1) / (f2 - f1)
+                                interp_vals.append(g1 + t*(g2-g1))
+                                break
+                return np.array(interp_vals)
+            hp_interp = interp_curve(hp_data, freqs)
+            if harman_data:
+                harman_interp = interp_curve(harman_data, freqs)
+            else:
+                harman_interp = np.zeros_like(freqs)
+            hp_minus_harman = hp_interp - harman_interp
+            if self.hearing_file:
+                hearing_data = load_hearing_csv(self.hearing_file, partial_factor=self.hearing_factor_var.get())
+                hearing_interp = interp_curve(hearing_data, freqs)
+            else:
+                hearing_interp = np.zeros_like(freqs)
+            merged = hp_minus_harman + hearing_interp
+            _, target_db = build_target_curve(list(zip(freqs, merged)))
+            
+            plt.figure(figsize=(10,8))
+            plt.subplot(2,1,1)
+            plt.plot(freqs, hp_interp, label="Headphone Measurement", color='black')
+            plt.plot(freqs, harman_interp, label="Harman Reference", color='blue', linestyle='--')
+            plt.plot(freqs, hp_minus_harman, label="Measurement - Reference", color='purple')
+            plt.plot(freqs, hearing_interp, label="Hearing Correction", color='orange')
+            plt.plot(freqs, merged, label="Merged (Pre-Normalization)", color='green')
+            plt.xscale("log")
+            plt.xlabel("Frequency (Hz)")
+            plt.ylabel("dB")
+            plt.title("Intermediate Curves")
+            plt.legend()
+            plt.grid(True, which='both', linestyle=':')
+            
+            plt.subplot(2,1,2)
+            plt.plot(freqs, target_db, label="Normalized Target Curve", color='red')
+            plt.xscale("log")
+            plt.xlabel("Frequency (Hz)")
+            plt.ylabel("dB")
+            plt.title("Final Target Curve (After Normalization)")
+            plt.legend()
+            plt.grid(True, which='both', linestyle=':')
+            plt.tight_layout()
+            plt.show()
+        except Exception as e:
+            self.status_label.config(text=f"Error showing intermediate curves: {e}", fg="red")
+
+def main():
+    multiprocessing.freeze_support()
+    root = tk.Tk()
+    gui = AutoEQPEQGUI(root)
+    root.mainloop()
+
+if __name__ == "__main__":
+    main()
